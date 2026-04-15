@@ -17,8 +17,7 @@ if str(ROOT) not in sys.path:
 import httpx
 
 from app.config import Settings
-from app.models_io import GenerateRequest, ResponseKind
-from app.pipeline import run_generate_pipeline
+from app.pipeline import generate_lua
 from app.sandbox import run_lua_with_wf
 from app.validate import luac_check, static_guard_violations
 
@@ -29,20 +28,19 @@ def load_tasks(path: Path | None = None) -> list[dict]:
         return json.load(f)
 
 
-def merge_prompt_with_benchmark(task: dict) -> str:
-    """Benchmark `context` is embedded in the prompt only (not a separate API field)."""
-    prompt = task["prompt"]
-    ctx = task.get("context")
-    if ctx is None:
-        return prompt
-    return (
-        f"{prompt}\n\nContext:\n"
-        f"{json.dumps(ctx, ensure_ascii=False, indent=2)}"
-    )
-
-
 def heuristic_pass(code: str, expected_contains: list[str]) -> bool:
     return all(s in code for s in expected_contains)
+
+
+def _infra_failure_from_errors(errors: list[str]) -> bool:
+    for msg in errors:
+        if "not found" in msg and ("lua" in msg or "luac" in msg):
+            return True
+    return False
+
+
+def _is_infra_exception(exc: BaseException) -> bool:
+    return isinstance(exc, (httpx.HTTPError, TimeoutError, OSError))
 
 
 async def run_one_direct(
@@ -51,22 +49,22 @@ async def run_one_direct(
     task: dict,
 ) -> dict:
     t0 = time.perf_counter()
-    eval_settings = settings.model_copy(update={"clarification_mode": False})
-    req = GenerateRequest(prompt=merge_prompt_with_benchmark(task))
-    resp = await run_generate_pipeline(client, eval_settings, req)
+    code, log, _report = await generate_lua(
+        client,
+        settings,
+        task["prompt"],
+        context=task.get("context"),
+    )
     dt = time.perf_counter() - t0
-    if resp.response_kind != ResponseKind.code:
-        raise RuntimeError(f"expected code response, got {resp.response_kind!r}")
-    code = resp.code or ""
-    return {"code": code, "latency_s": dt}
+    return {"code": code, "log": log, "latency_s": dt}
 
 
-def score_task(task: dict, code: str) -> dict:
+def score_task(task: dict, code: str, *, settings: Settings) -> dict:
     ev = task.get("eval") or {}
     et = ev.get("type", "heuristic")
     errs: list[str] = []
 
-    ok_l, msg = luac_check(code, luac_path=Settings().luac_path)
+    ok_l, msg = luac_check(code, luac_path=settings.luac_path)
     if not ok_l:
         errs.append(f"luac:{msg}")
 
@@ -79,7 +77,7 @@ def score_task(task: dict, code: str) -> dict:
     if et == "sandbox" and ok_l and static_ok:
         ctx = task.get("context") or {}
         wf_root = ctx.get("wf", ctx)
-        sb_ok, out, err = run_lua_with_wf(code, wf_root, lua_bin=Settings().lua_path)
+        sb_ok, out, err = run_lua_with_wf(code, wf_root, lua_bin=settings.lua_path)
         if not sb_ok:
             sandbox_ok = False
             errs.append(f"sandbox:{err or out}")
@@ -96,6 +94,7 @@ def score_task(task: dict, code: str) -> dict:
 
     return {
         "syntax_ok": ok_l,
+        "static_ok": static_ok,
         "sandbox_ok": sandbox_ok,
         "heuristic_ok": heur_ok,
         "errors": errs,
@@ -110,60 +109,131 @@ async def main_async(args: argparse.Namespace) -> int:
     if args.http:
         async with httpx.AsyncClient(base_url=args.base_url, timeout=180.0) as hc:
             for t in tasks:
+                infra_fail = False
+                generation_error = False
+                latency_s: float | None = None
+                code = ""
                 try:
                     t0 = time.perf_counter()
-                    payload = {"prompt": merge_prompt_with_benchmark(t)}
+                    payload = {"prompt": t["prompt"]}
+                    if t.get("context") is not None:
+                        payload["context"] = t["context"]
                     r = await hc.post("/generate", json=payload)
                     r.raise_for_status()
                     data = r.json()
-                    if data.get("response_kind") != "code":
-                        raise RuntimeError(
-                            f"expected response_kind code, got {data.get('response_kind')!r}"
-                        )
-                    code = data.get("code") or ""
+                    code = data.get("code", "") or ""
                     dt = time.perf_counter() - t0
-                    sc = score_task(t, code)
-                    results.append(
-                        {
-                            "id": t["id"],
-                            **sc,
-                            "latency_s": dt,
-                            "code_preview": code[:200],
-                        }
-                    )
+                    sc = score_task(t, code, settings=settings)
+                    if _infra_failure_from_errors(sc["errors"]):
+                        infra_fail = True
+                    if not code.strip():
+                        generation_error = True
+                    latency_s = float(dt)
                 except Exception as e:
-                    results.append({"id": t["id"], "pass": False, "errors": [str(e)]})
+                    latency_s = None
+                    code = ""
+                    if _is_infra_exception(e):
+                        infra_fail = True
+                    else:
+                        generation_error = True
+                    sc = {
+                        "syntax_ok": False,
+                        "static_ok": False,
+                        "sandbox_ok": False,
+                        "heuristic_ok": False,
+                        "errors": [str(e)],
+                        "pass": False,
+                    }
+
+                row = {
+                    "id": t["id"],
+                    **sc,
+                    "latency_s": latency_s,
+                    "infra_fail": infra_fail,
+                    "generation_error": generation_error,
+                    "model_error": False,
+                    "code_preview": code[:200],
+                }
+
+                if not row["pass"] and not row["infra_fail"] and not row["generation_error"]:
+                    row["model_error"] = True
+                results.append(row)
     else:
         client = httpx.AsyncClient()
         try:
             for t in tasks:
+                infra_fail = False
+                generation_error = False
+                latency_s: float | None = None
                 try:
                     r = await run_one_direct(client, settings, t)
-                    sc = score_task(t, r["code"])
-                    results.append(
-                        {
-                            "id": t["id"],
-                            **sc,
-                            "latency_s": r["latency_s"],
-                            "code_preview": r["code"][:200],
-                        }
-                    )
+                    code = r["code"]
+                    sc = score_task(t, code, settings=settings)
+                    if _infra_failure_from_errors(sc["errors"]):
+                        infra_fail = True
+                    if not (code or "").strip():
+                        generation_error = True
+                    latency_s = float(r["latency_s"])
                 except Exception as e:
-                    results.append({"id": t["id"], "pass": False, "errors": [str(e)]})
+                    latency_s = None
+                    if _is_infra_exception(e):
+                        infra_fail = True
+                    else:
+                        generation_error = True
+                    sc = {
+                        "syntax_ok": False,
+                        "static_ok": False,
+                        "sandbox_ok": False,
+                        "heuristic_ok": False,
+                        "errors": [str(e)],
+                        "pass": False,
+                    }
+                    code = ""
+
+                row = {
+                    "id": t["id"],
+                    **sc,
+                    "latency_s": latency_s,
+                    "infra_fail": infra_fail,
+                    "generation_error": generation_error,
+                    "model_error": False,
+                    "code_preview": (code or "")[:200],
+                }
+                if not row["pass"] and not row["infra_fail"] and not row["generation_error"]:
+                    row["model_error"] = True
+                results.append(row)
         finally:
             await client.aclose()
 
     passed = sum(1 for x in results if x.get("pass"))
-    out = {
-        "passed": passed,
+    lat_samples = [x["latency_s"] for x in results if x.get("latency_s") is not None]
+    lat_samples_f = [float(x) for x in lat_samples]
+    lat_samples_f.sort()
+    p95_idx = int(0.95 * (len(lat_samples_f) - 1)) if lat_samples_f else 0
+    metrics = {
         "total": len(tasks),
+        "passed": passed,
+        "syntax_ok": sum(1 for x in results if x.get("syntax_ok")),
+        "static_ok": sum(1 for x in results if x.get("static_ok")),
+        "sandbox_ok": sum(1 for x in results if x.get("sandbox_ok")),
+        "heuristic_ok": sum(1 for x in results if x.get("heuristic_ok")),
+        "infra_fail": sum(1 for x in results if x.get("infra_fail")),
+        "generation_error": sum(1 for x in results if x.get("generation_error")),
+        "model_error": sum(1 for x in results if x.get("model_error")),
+        "latency_avg": (sum(lat_samples_f) / len(lat_samples_f)) if lat_samples_f else None,
+        "latency_p95": lat_samples_f[p95_idx] if lat_samples_f else None,
+        "latency_samples": len(lat_samples_f),
+    }
+    out = {
+        "metrics": metrics,
         "results": results,
+        "settings": settings.model_dump(),
     }
     print(json.dumps(out, indent=2, ensure_ascii=False))
     return 0 if passed == len(tasks) else 1
 
 
-def main() -> int:
+def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument(
         "--http",

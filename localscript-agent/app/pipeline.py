@@ -1,322 +1,210 @@
 from __future__ import annotations
 
-import json
+import hashlib
 
 import httpx
 
-from app.code_checks import CheckResult, log_check_outcome, result_to_check_items, run_all_checks
 from app.config import Settings
 from app.extract import extract_lua
-from app.generate_parse import parse_debug_response, parse_generate_response
-from app.models_io import (
-    AttemptRecord,
-    DebugHistoryTurn,
-    DebugRequest,
-    DebugResponse,
-    GenerateRequest,
-    GenerateResponse,
-    RefineRequest,
-    ResponseKind,
-    StopReason,
-)
 from app.ollama_client import chat_completion
-from app.prompts import (
-    build_debug_user_message,
-    build_generate_user_message,
-    build_refinement_user_message,
-    messages_for_chat,
-    messages_for_debug_chat,
-    messages_for_generate_chat,
-    repair_user_message_compact,
-)
+from app.prompts import build_user_message, messages_for_chat, repair_user_message_structured
+from app.semantic import semantic_validate
+from app.validate import validate_code
 
 
-def effective_max_repair(settings: Settings, override: int | None) -> int:
-    cap = settings.max_repair_server_cap
-    if override is not None:
-        return min(override, cap)
-    return min(settings.max_repair_attempts, cap)
-
-
-def _extract_context_from_prompt(prompt: str) -> dict | None:
-    marker = "\n\nContext:\n"
-    pos = prompt.find(marker)
-    if pos < 0:
-        return None
-    raw = prompt[pos + len(marker) :].strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-async def run_repair_loop(
+async def generate_lua(
     client: httpx.AsyncClient,
     settings: Settings,
-    *,
-    task_prompt: str,
-    context: dict | None,
-    feedback: str | None,
-    initial_code: str,
-    max_repair_attempts: int,
-) -> tuple[
-    str,
-    list[AttemptRecord],
-    bool,
-    bool,
-    StopReason,
-    int,
-    bool,
-    list[str],
-]:
+    prompt: str,
+    context: dict | None = None,
+    previous_code: str | None = None,
+    feedback: str | None = None,
+) -> tuple[str, list[str], dict | None]:
     """
-    Validate initial_code and optionally run repair LLM rounds.
-
-    Returns:
-        final_code, attempts, all_checks_passed, degraded, stop_reason,
-        repair_rounds_used, first_validation_ok, log
+    Full loop: build prompt -> Ollama -> extract -> validate -> optional repair.
+    Returns (final_code, log_lines, repair_report_or_none).
     """
     log: list[str] = []
-    attempts: list[AttemptRecord] = []
-    code = initial_code.strip()
-    result = run_all_checks(code, settings=settings, context=context)
-    first_validation_ok = result.ok
-    attempts.append(
-        AttemptRecord(
-            index=0,
-            kind="initial",
-            code=code,
-            checks=result_to_check_items(result),
-        )
-    )
+    seen_fingerprints: set[str] = set()
+    history: list[dict] = []
 
-    if result.ok:
+    user_content = build_user_message(prompt, context, previous_code, feedback)
+    messages = messages_for_chat(user_content, include_few_shot=True)
+    raw = await chat_completion(client, settings, messages)
+    code = extract_lua(raw)
+    ok, errs = _validate_with_optional_semantic(code, settings=settings, context=context)
+    first_fp = _code_fingerprint(code)
+    seen_fingerprints.add(first_fp)
+    if ok:
         log.append("validate: pass (initial)")
-        log_check_outcome(outcome="pass", violations=(), repair_attempt=None)
-        return (
-            code,
-            attempts,
-            True,
-            False,
-            StopReason.validation_ok,
-            0,
-            first_validation_ok,
-            log,
-        )
+        return code, log, None
 
-    log.append(f"validate: fail initial: {'; '.join(result.error_lines())}")
-    log_check_outcome(outcome="fail", violations=result.violations, repair_attempt=None)
+    history.append(
+        {
+            "attempt": 0,
+            "phase": "initial",
+            "code_fingerprint": first_fp,
+            "errors": list(errs),
+            "repeated_code": False,
+        }
+    )
+    log.append(f"validate: fail initial: {'; '.join(errs)}")
+    for i in range(settings.max_repair_attempts):
+        repeated_code = _code_fingerprint(code) in seen_fingerprints and i > 0
+        repair_errors = list(errs)
+        if repeated_code:
+            repair_errors.append("repeat: candidate code repeated a prior failing attempt")
+        validation_report = _validation_report(repair_errors)
 
-    repair_rounds_used = 0
-    for i in range(max_repair_attempts):
-        repair_msg = repair_user_message_compact(
-            task_prompt=task_prompt,
-            context=context,
+        repair_msg = repair_user_message_structured(
+            task_prompt=prompt,
             broken_code=code,
-            error_lines=result.error_lines(),
-            feedback=feedback,
+            context=context,
+            validation_report=validation_report,
+            attempt_idx=i + 1,
+            prior_failures=history,
+            repeated_code=repeated_code,
         )
         repair_messages = messages_for_chat(repair_msg, include_few_shot=False)
         raw = await chat_completion(client, settings, repair_messages)
-        repair_rounds_used += 1
         code = extract_lua(raw)
-        result = run_all_checks(code, settings=settings, context=context)
-        attempts.append(
-            AttemptRecord(
-                index=repair_rounds_used,
-                kind="repair",
-                code=code,
-                checks=result_to_check_items(result),
-            )
+        ok, errs = _validate_with_optional_semantic(code, settings=settings, context=context)
+        fp = _code_fingerprint(code)
+        history.append(
+            {
+                "attempt": i + 1,
+                "phase": f"repair_{i + 1}",
+                "code_fingerprint": fp,
+                "errors": list(errs),
+                "repeated_code": fp in seen_fingerprints,
+            }
         )
-        if result.ok:
-            log.append(f"validate: pass after repair {repair_rounds_used}")
-            log_check_outcome(outcome="pass", violations=(), repair_attempt=repair_rounds_used)
-            return (
-                code,
-                attempts,
-                True,
-                False,
-                StopReason.validation_ok,
-                repair_rounds_used,
-                first_validation_ok,
-                log,
-            )
-        log.append(f"validate: fail repair {repair_rounds_used}: {'; '.join(result.error_lines())}")
-        log_check_outcome(
-            outcome="fail",
-            violations=result.violations,
-            repair_attempt=repair_rounds_used,
-        )
+        seen_fingerprints.add(fp)
+        if ok:
+            log.append(f"validate: pass after repair {i + 1}")
+            return code, log, None
+        log.append(f"validate: fail repair {i + 1}: {'; '.join(errs)}")
 
     log.append("validate: returning last attempt despite errors")
-    log_check_outcome(outcome="fail_final", violations=result.violations, repair_attempt=None)
-    return (
-        code,
-        attempts,
-        False,
-        True,
-        StopReason.max_repairs_exhausted,
-        repair_rounds_used,
-        first_validation_ok,
-        log,
+    report = _confidence_gate_report(
+        task_prompt=prompt,
+        context=context,
+        final_code=code,
+        final_errors=errs,
+        max_repair_attempts=settings.max_repair_attempts,
+        history=history,
     )
+    return code, log, report
 
 
-async def run_generate_pipeline(
-    client: httpx.AsyncClient,
+def _code_fingerprint(code: str) -> str:
+    return hashlib.sha1(code.strip().encode("utf-8")).hexdigest()
+
+
+def _validation_report(errors: list[str]) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    for msg in errors:
+        etype = "other"
+        if msg.startswith("syntax:"):
+            etype = "syntax"
+        elif msg.startswith("static:"):
+            etype = "static"
+        elif msg.startswith("sandbox:"):
+            etype = "sandbox"
+        elif msg.startswith("heuristic:"):
+            etype = "heuristic"
+        elif msg.startswith("semantic:"):
+            etype = "semantic"
+        elif msg.startswith("repeat:"):
+            etype = "repeat"
+        out.append({"error_type": etype, "message": msg})
+    return out
+
+
+def _validate_with_optional_semantic(
+    code: str,
+    *,
     settings: Settings,
-    body: GenerateRequest,
-) -> GenerateResponse:
-    clarification_mode = settings.clarification_mode
-    user_msg = build_generate_user_message(
-        body.prompt,
-        body.clarification_history,
-    )
-    messages = messages_for_generate_chat(user_msg, clarification_mode=clarification_mode)
-    raw = await chat_completion(client, settings, messages)
+    context: dict | None,
+) -> tuple[bool, list[str]]:
+    ok, errs = validate_code(code, luac_path=settings.luac_path)
+    if not ok:
+        return False, errs
 
-    kind, question, lua, parse_err = parse_generate_response(raw)
-    if kind == "clarification" and question:
-        return GenerateResponse(
-            response_kind=ResponseKind.clarification,
-            clarification_question=question,
-            code=None,
-            attempts=[],
-            all_checks_passed=None,
-            degraded=None,
-            stop_reason=None,
-            llm_rounds=1,
-            repair_rounds_used=0,
+    if not _semantic_validation_enabled_for_request(
+        settings_enabled=settings.enable_semantic_validation,
+        context=context,
+        context_key=settings.semantic_context_key,
+    ):
+        return True, []
+
+    sem_ok, sem_errs = semantic_validate(
+        code,
+        context=context,
+        lua_bin=settings.lua_path,
+        context_key=settings.semantic_context_key,
+    )
+    if not sem_ok:
+        return False, sem_errs
+    return True, []
+
+
+def _semantic_validation_enabled_for_request(
+    *,
+    settings_enabled: bool,
+    context: dict | None,
+    context_key: str,
+) -> bool:
+    """
+    Semantic validation is enabled if either:
+    1) global setting is enabled, or
+    2) request context includes a semantic spec object.
+    """
+    if settings_enabled:
+        return True
+    if not isinstance(context, dict):
+        return False
+    return isinstance(context.get(context_key), dict)
+
+
+def _confidence_gate_report(
+    *,
+    task_prompt: str,
+    context: dict | None,
+    final_code: str,
+    final_errors: list[str],
+    max_repair_attempts: int,
+    history: list[dict],
+) -> dict:
+    error_counts: dict[str, int] = {}
+    for h in history:
+        for e in h.get("errors", []):
+            error_counts[e] = error_counts.get(e, 0) + 1
+    repeated_error_patterns = [
+        {"error": err, "count": count} for err, count in error_counts.items() if count > 1
+    ]
+    repeated_error_patterns.sort(key=lambda x: x["count"], reverse=True)
+
+    recommendation = (
+        "Нужны дополнительные уточнения по задаче или данным. "
+        "Рекомендуется вызвать /clarify и затем повторить /generate."
+    )
+    if not context:
+        recommendation = (
+            "Контекст отсутствует или неполон. Передайте JSON-контекст (wf.vars/wf.initVariables) "
+            "через /clarify answers или context в /generate."
         )
 
-    parse_warning: str | None = None
-    if kind == "parse_error":
-        lua = extract_lua(raw)
-        parse_warning = f"JSON parse failed ({parse_err}); used extract_lua fallback"
-    elif kind == "code":
-        lua = lua or ""
-
-    if not lua or not str(lua).strip():
-        raise ValueError("empty Lua after generate parse and extract_lua fallback")
-
-    context = _extract_context_from_prompt(body.prompt)
-    max_r = effective_max_repair(settings, body.max_repair_attempts)
-    (
-        final_code,
-        attempts,
-        all_ok,
-        degraded,
-        stop_reason,
-        repair_used,
-        _first_ok,
-        _log,
-    ) = await run_repair_loop(
-        client,
-        settings,
-        task_prompt=body.prompt,
-        context=context,
-        feedback=None,
-        initial_code=str(lua).strip(),
-        max_repair_attempts=max_r,
-    )
-
-    return GenerateResponse(
-        response_kind=ResponseKind.code,
-        code=final_code,
-        attempts=attempts,
-        all_checks_passed=all_ok,
-        degraded=degraded,
-        stop_reason=stop_reason,
-        llm_rounds=1 + repair_used,
-        repair_rounds_used=repair_used,
-        parse_warning=parse_warning,
-    )
-
-
-async def run_refine_pipeline(
-    client: httpx.AsyncClient,
-    settings: Settings,
-    body: RefineRequest,
-) -> GenerateResponse:
-    user_msg = build_refinement_user_message(
-        body.prompt,
-        body.refinement_history,
-    )
-    messages = messages_for_chat(user_msg, include_few_shot=True)
-    raw = await chat_completion(client, settings, messages)
-    code = extract_lua(raw)
-    if not code or not code.strip():
-        raise ValueError("empty Lua after refine generation")
-
-    context = _extract_context_from_prompt(body.prompt)
-    feedback = body.refinement_history[-1].user_feedback
-    max_r = effective_max_repair(settings, body.max_repair_attempts)
-    (
-        final_code,
-        attempts,
-        all_ok,
-        degraded,
-        stop_reason,
-        repair_used,
-        _first_ok,
-        _log,
-    ) = await run_repair_loop(
-        client,
-        settings,
-        task_prompt=body.prompt,
-        context=context,
-        feedback=feedback,
-        initial_code=code.strip(),
-        max_repair_attempts=max_r,
-    )
-
-    return GenerateResponse(
-        response_kind=ResponseKind.code,
-        code=final_code,
-        attempts=attempts,
-        all_checks_passed=all_ok,
-        degraded=degraded,
-        stop_reason=stop_reason,
-        llm_rounds=1 + repair_used,
-        repair_rounds_used=repair_used,
-    )
-
-
-def _checks_text_for_debug(result: CheckResult) -> str:
-    """Compact summary for the debug LLM prompt (not the full checks array)."""
-    if result.ok:
-        return "all_checks_passed: true"
-    lines = ["all_checks_passed: false", "Failed checks:"]
-    lines.extend(f"- {line}" for line in result.error_lines())
-    return "\n".join(lines)
-
-
-async def run_debug_pipeline(
-    client: httpx.AsyncClient,
-    settings: Settings,
-    body: DebugRequest,
-) -> DebugResponse:
-    result = run_all_checks(body.code, settings=settings)
-    checks = result_to_check_items(result)
-    hist: list[DebugHistoryTurn] = list(body.debug_history)
-    checks_text = _checks_text_for_debug(result)
-    user_msg = build_debug_user_message(body.code, body.prompt, hist, checks_text)
-    messages = messages_for_debug_chat(user_msg)
-    raw = await chat_completion(client, settings, messages)
-    problem, suggested, err = parse_debug_response(raw)
-    if err or problem is None or suggested is None:
-        raise ValueError(f"debug response parse failed: {err or 'missing fields'}")
-    if not str(suggested).strip():
-        suggested = body.code.strip()
-    if not str(problem).strip():
-        problem = "No textual analysis returned; treating suggested_code as echo of input."
-    return DebugResponse(
-        checks=checks,
-        all_checks_passed=result.ok,
-        problem_description=problem,
-        suggested_code=suggested,
-    )
+    return {
+        "status": "low_confidence",
+        "confidence_gate_triggered": True,
+        "task_prompt": task_prompt,
+        "context_present": context is not None,
+        "attempts_made": len(history),
+        "max_repair_attempts": max_repair_attempts,
+        "final_errors": list(final_errors),
+        "final_code_fingerprint": _code_fingerprint(final_code),
+        "error_history": history,
+        "repeated_error_patterns": repeated_error_patterns,
+        "recommendation": recommendation,
+    }

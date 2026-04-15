@@ -1,27 +1,27 @@
-# LocalScript Agent (`json_context`)
+# LocalScript Agent (`lua_manual`)
 
-Локальный сервис генерации и отладки Lua-кода: `FastAPI` + `Ollama` + repair loop + проверки качества. Runtime не использует внешние LLM API.
+Локальный сервис генерации Lua-кода для защищенных контуров: `FastAPI` + `Ollama` + встроенный pipeline проверки и доработки кода. Runtime не использует внешние LLM API.
 
 API-контракт: `../localscript-openapi.yaml`
 
 ## Назначение
 
-Проект реализует stateless tim-style агентный контур:
+Проект реализует агентный цикл под требования трека:
 - генерация Lua по естественному языку;
-- встроенный clarification в `POST /generate`;
-- итеративная доработка через `POST /refine`;
-- диагностика кода через `POST /debug`;
-- воспроизводимый локальный запуск для MLOps/DevOps.
+- уточнение требований перед генерацией;
+- итеративная доработка кода по обратной связи;
+- синтаксическая, статическая и опциональная семантическая валидация;
+- reproducible deployment для MLOps/DevOps.
 
 ## Архитектура
 
 Основные модули:
-- `app/main.py` — HTTP endpoints;
-- `app/pipeline.py` — orchestration generate/refine/debug + repair loop;
-- `app/code_checks.py` — `run_all_checks` (syntax/static/sandbox/semantic);
-- `app/generate_parse.py` — JSON parse model output;
-- `app/prompts.py` — шаблоны prompt-коммуникации;
-- `app/ollama_client.py` — вызовы Ollama, health/warmup.
+- `app/main.py` — endpoints и lifecycle приложения;
+- `app/pipeline.py` — generate/repair loop + confidence gate;
+- `app/clarify.py` — построение уточняющих вопросов и merge контекста;
+- `app/validate.py` — `luac` + статические ограничения;
+- `app/semantic.py`, `app/sandbox.py` — семантическая проверка через sandbox;
+- `app/ollama_client.py` — интеграция с локальным Ollama.
 
 ## API
 
@@ -29,20 +29,16 @@ API-контракт: `../localscript-openapi.yaml`
 
 Эндпоинты:
 - `GET /health`
+- `POST /clarify`
+- `POST /generate-from-clarify`
 - `POST /generate`
 - `POST /refine`
-- `POST /debug`
 
 Модель API в этой ветке:
-- clarification встроен в `POST /generate` и возвращается как `response_kind=clarification`;
-- финальный код возвращается как `response_kind=code`;
-- telemetry включает:
-  - `attempts`
-  - `all_checks_passed`
-  - `degraded`
-  - `stop_reason`
-  - `llm_rounds`
-  - `repair_rounds_used`.
+- clarification вынесен в отдельные endpoints;
+- ответ генерации содержит `code` и опционально confidence-gate поля:
+  - `confidence_gate_triggered`
+  - `repair_report`.
 
 ## Быстрый запуск (Docker)
 
@@ -54,7 +50,7 @@ docker compose up --build
 После старта:
 - API: `http://127.0.0.1:8080`
 - Ollama: `http://127.0.0.1:11434`
-- модель: `qwen2.5-coder:7b`
+- модель по умолчанию: `qwen2.5-coder:7b`
 
 ## Рекомендуемые параметры модели
 
@@ -66,7 +62,13 @@ ollama pull qwen2.5-coder:7b
 - `NUM_PREDICT=256`
 - `NUM_BATCH=1`
 - `NUM_PARALLEL=1`
-- `OLLAMA_NUM_GPU=999`
+- `OLLAMA_NUM_GPU=999` (полное размещение слоев на GPU)
+
+Особенности этой ветки:
+- в `docker-compose.yml` включен warmup:
+  - `OLLAMA_WARMUP_ENABLED=true`
+  - `OLLAMA_WARMUP_TIMEOUT_SECONDS=240`
+  - `OLLAMA_HEALTH_TIMEOUT_SECONDS=5`.
 
 ## Локальная разработка
 
@@ -76,29 +78,7 @@ conda activate localscript-agent
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-Требуется `lua` и `luac` в `PATH`.
-
-## Эксплуатация CLI
-
-Интерактивный клиент: `scripts/demo_cli.py`
-
-```bash
-python scripts/demo_cli.py
-```
-
-Полезные флаги:
-- `--base-url`
-- `--timeout`
-- `--context-file`
-- `--verbose`
-
-Команды:
-- `/help`, `/quit`
-- `/health`, `/settings`, `/url <url>`
-- `/ctx <file.json>`, `/ctx show`, `/ctx clear`
-- `/refine`
-- `/debug`, `/debug <text>`, `/debug new`
-- `/log`, `/log N`, `/log all`, `/log clear`
+Требуется наличие `lua` и `luac` в `PATH`.
 
 ## Эксплуатация GUI
 
@@ -109,11 +89,34 @@ python -m streamlit run scripts/demo_streamlit.py
 ```
 
 GUI поддерживает:
-- stateless flow generate/refine/debug;
-- clarification chat и хранение истории на клиенте;
-- semantic rules injection в prompt (`Context:` блок);
-- сохранение/загрузку истории:
-  - `artifacts/gui_chat_history.jsonl`.
+- проверку `health`;
+- flow `clarify -> generate-from-clarify -> refine`;
+- режим `generate` с optional `previous_code`/`feedback`;
+- инъекцию `__semantic_validation` в `context`;
+- панель `Action readiness` для валидации входов до отправки.
+
+## Эксплуатация CLI
+
+В этой ветке нет отдельного интерактивного REPL-клиента.  
+CLI-сценарии выполняются через `curl`/PowerShell или CI-скрипты.
+
+Примеры:
+
+```bash
+curl -s http://127.0.0.1:8080/health
+```
+
+```bash
+curl -s http://127.0.0.1:8080/clarify \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"Отфильтруй parsedCsv по Discount\",\"context\":null,\"answers\":[]}"
+```
+
+```bash
+curl -s http://127.0.0.1:8080/refine \
+  -H "Content-Type: application/json" \
+  -d "{\"prompt\":\"То же задание\",\"previous_code\":\"return n\",\"feedback\":\"Добавь проверку входа\"}"
+```
 
 ## Тесты и качество
 
@@ -142,18 +145,17 @@ Direct/in-process:
 python scripts/eval_public.py
 ```
 
-## Отличия от `lua_manual` версии
+## Отличия от `json_context` версии
 
-- clarification реализован внутри `POST /generate` (нет отдельных `/clarify` и `/generate-from-clarify`);
-- есть `POST /debug`;
-- есть полноценный интерактивный CLI REPL;
-- richer telemetry в ответе (`attempts`, `stop_reason`, `degraded` и т.д.).
+- здесь используются отдельные `POST /clarify` и `POST /generate-from-clarify`;
+- нет `POST /debug`;
+- акцент на confidence-gate (`confidence_gate_triggered`, `repair_report`);
+- нет отдельного demo CLI REPL.
 
 ## Дополнительная документация
 
 - `docs/SETUP_GUIDE.md`
 - `docs/AGENT_WORKFLOW.md`
-- `docs/CLI_CURRENT_BEHAVIOR.md`
 - `docs/architecture.md`
 - `docs/hardware.md`
 - `docs/vram_smoke.md`

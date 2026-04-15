@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         default=5.0,
         validation_alias=AliasChoices("OLLAMA_HEALTH_TIMEOUT_SECONDS", "ollama_health_timeout_s"),
     )
+
     ollama_warmup_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("OLLAMA_WARMUP_ENABLED", "ollama_warmup_enabled"),
@@ -33,16 +34,8 @@ class Settings(BaseSettings):
     top_p: float = 0.95
 
     max_repair_attempts: int = 2
-    max_repair_server_cap: int = 5
-
-    # If false, generate uses code-only JSON (no clarification branch); for deterministic eval.
-    clarification_mode: bool = True
     luac_path: str = "luac"
     lua_path: str = "lua"
-
-    validation_linter: bool = False
-    linter_path: str = "selene"
-    linter_timeout_s: float = 30.0
     enable_semantic_validation: bool = Field(
         default=False,
         validation_alias=AliasChoices("ENABLE_SEMANTIC_VALIDATION", "enable_semantic_validation"),

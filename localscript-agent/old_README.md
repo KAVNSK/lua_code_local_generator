@@ -3,10 +3,11 @@
 Этот файл зафиксирован перед унификацией документации подпроектов.
 
 Предыдущая версия внутреннего README включала:
-- tim-style stateless API и поток работы через `POST /generate`, `POST /refine`, `POST /debug`;
-- расширенную телеметрию repair loop (`attempts`, `checks`, `degraded`, `stop_reason`);
-- демонстрационный CLI (`scripts/demo_cli.py`) и Streamlit GUI;
-- примеры `curl` по всем endpoint;
-- команды тестирования/линтинга/eval и ссылки на архитектурную документацию.
+- запуск через `docker compose up --build` и описание параметров инференса;
+- warmup/health переменные и семантическую валидацию через `__semantic_validation`;
+- demo GUI (`scripts/demo_streamlit.py`) с потоками `clarify -> generate -> refine`;
+- API-описание `POST /clarify`, `POST /generate`, `POST /generate-from-clarify`, `POST /refine`, `GET /health`;
+- команды `eval_public.py`, `generate_synthetic_dataset.py`, `quality.sh`;
+- ссылки на установку, workflow, submission и hardware/vram документы.
 
 Актуальная унифицированная версия: `README.md`.
