@@ -1,45 +1,45 @@
 # LocalScript (ветка `json_context`)
 
-Локальная агентская система генерации/доработки Lua-кода для трека МТС LocalScript.  
-Версия ориентирована на stateless tim-style API: сервер не хранит диалоговую сессию, клиент каждый раз передает всю историю в теле запроса.
+Это локальная агентская система для генерации и доработки Lua-кода в треке МТС LocalScript.  
+API сделан в stateless-режиме: сервер не хранит сессию, клиент каждый раз отправляет всю историю в теле запроса.
 
-## 1) Задача и инженерные требования
+## Что здесь решается
 
-Репозиторий реализует решение под ограничения трека:
-- локальная lightweight LLM через Ollama;
-- отсутствие внешних AI-вендоров в runtime;
-- генерация Lua с валидацией и repair loop;
-- поддержка агентных итераций (clarification/refine/debug);
-- воспроизводимый запуск для MLOps/DevOps контура.
+Репозиторий закрывает базовые ограничения трека:
+- локальная LLM через `Ollama`;
+- без внешних AI-вендоров в runtime;
+- генерация Lua с проверками и repair loop;
+- итерации `clarification` / `refine` / `debug`;
+- воспроизводимый запуск под MLOps/DevOps.
 
-Контекст задания: `instruction.txt`.  
-Контракт API: `localscript-openapi.yaml`.
+Контекст задания лежит в `instruction.txt`.  
+OpenAPI-контракт: `localscript-openapi.yaml`.
 
-## 2) Ключевая идея решения
+## Как устроен flow
 
-В отличие от explicit-clarify подхода, здесь clarification встроен в основной endpoint генерации:
+Вопросы на уточнение встроены прямо в генерацию:
 - `POST /generate` возвращает либо `response_kind=clarification`, либо `response_kind=code`;
-- клиент отвечает и снова вызывает `POST /generate`, передавая обновленный `clarification_history`.
+- клиент дополняет `clarification_history` и снова вызывает `POST /generate`.
 
-Доработка и отладка:
-- `POST /refine` работает через `refinement_history` (непустая цепочка шагов);
-- `POST /debug` запускает проверки текущего Lua и один review-раунд модели с `debug_history`.
+Доработка и отладка вынесены отдельно:
+- `POST /refine` использует непустой `refinement_history`;
+- `POST /debug` прогоняет проверки Lua и делает review-раунд модели с `debug_history`.
 
-## 3) Структура репозитория
+## Структура репозитория
 
-- `localscript-agent/` — сервис (FastAPI + pipeline + проверки + demo clients).
-- `localscript-openapi.yaml` — OpenAPI контракт этой версии.
-- `docs/INSTALL_WINDOWS.md`, `docs/INSTALL_LINUX.md` — установка на платформах.
+- `localscript-agent/` - основной сервис (`FastAPI`, pipeline, проверки, demo-клиенты).
+- `localscript-openapi.yaml` - актуальный API-контракт.
+- `docs/INSTALL_WINDOWS.md`, `docs/INSTALL_LINUX.md` - установка.
 
-Ключевые компоненты:
-- `localscript-agent/app/main.py` — endpoints `/health`, `/generate`, `/refine`, `/debug`.
-- `localscript-agent/app/pipeline.py` — orchestration generate/refine/debug + repair loop.
-- `localscript-agent/app/code_checks.py` — `run_all_checks` (syntax/static/sandbox/semantic).
-- `localscript-agent/app/generate_parse.py` — parse JSON-ответа модели.
-- `localscript-agent/scripts/demo_cli.py` — интерактивный CLI.
-- `localscript-agent/scripts/demo_streamlit.py` — GUI.
+Ключевые файлы:
+- `localscript-agent/app/main.py` - `/health`, `/generate`, `/refine`, `/debug`;
+- `localscript-agent/app/pipeline.py` - orchestration generate/refine/debug + repair loop;
+- `localscript-agent/app/code_checks.py` - `run_all_checks` (syntax/static/sandbox/semantic);
+- `localscript-agent/app/generate_parse.py` - парсинг JSON-ответа модели;
+- `localscript-agent/scripts/demo_cli.py` - интерактивный CLI;
+- `localscript-agent/scripts/demo_streamlit.py` - GUI.
 
-## 4) Архитектура
+## Архитектура
 
 ```mermaid
 flowchart LR
@@ -54,32 +54,32 @@ flowchart LR
   G --> REP[repair loop + attempts telemetry]
 ```
 
-## 5) API
+## API
 
 База: `http://127.0.0.1:8080`  
 Контракт: `localscript-openapi.yaml`
 
 Эндпоинты:
-- `GET /health` — состояние сервиса/Ollama/модели.
-- `POST /generate` — новый запрос, может вернуть уточняющий вопрос до кода.
-- `POST /refine` — следующая итерация с `refinement_history`.
-- `POST /debug` — проверки + объяснение проблемы + `suggested_code`.
+- `GET /health` - проверка сервиса, `Ollama` и модели;
+- `POST /generate` - стартовая генерация, при необходимости возвращает вопрос;
+- `POST /refine` - следующая итерация по `refinement_history`;
+- `POST /debug` - проверки, объяснение проблемы и `suggested_code`.
 
-Ключевые поля ответа `generate/refine`:
-- `response_kind` (`clarification` | `code`),
-- `attempts` (история initial/repair попыток и checks),
-- `all_checks_passed`, `degraded`, `stop_reason`,
-- `llm_rounds`, `repair_rounds_used`,
-- `parse_warning` (если сработал fallback parser).
+Важные поля в `generate/refine`:
+- `response_kind` (`clarification` | `code`);
+- `attempts` (история initial/repair попыток и checks);
+- `all_checks_passed`, `degraded`, `stop_reason`;
+- `llm_rounds`, `repair_rounds_used`;
+- `parse_warning` (если включился fallback parser).
 
-Коды:
-- `200` — OK,
-- `422` — validation error,
-- `502` — upstream/parse/runtime pipeline error.
+HTTP-коды:
+- `200` - успех;
+- `422` - ошибка валидации;
+- `502` - upstream/parse/runtime ошибка pipeline.
 
-## 6) Установка и запуск
+## Установка и запуск
 
-### 6.1 Docker Compose (рекомендуется)
+### Docker Compose (рекомендуется)
 
 ```bash
 cd localscript-agent
@@ -89,16 +89,16 @@ docker compose up --build
 После старта:
 - API: `http://127.0.0.1:8080`
 - Ollama: `http://127.0.0.1:11434`
-- default model: `qwen2.5-coder:7b`
+- модель по умолчанию: `qwen2.5-coder:7b`
 
-Рекомендуемые параметры (из условий трека):
+Рекомендованные параметры (по условиям трека):
 - `NUM_CTX=4096`
 - `NUM_PREDICT=256`
 - `NUM_BATCH=1`
 - `NUM_PARALLEL=1`
 - `OLLAMA_NUM_GPU=999`
 
-### 6.2 Локальный dev-режим
+### Локальный dev-режим
 
 ```bash
 cd localscript-agent
@@ -107,11 +107,11 @@ conda activate localscript-agent
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8080
 ```
 
-Нужны `lua`/`luac` в `PATH`.
+Нужны `lua` и `luac` в `PATH`.
 
-## 7) Эксплуатация: CLI и GUI
+## CLI и GUI
 
-### CLI (основной интерактивный контур)
+### CLI
 
 ```bash
 cd localscript-agent
@@ -124,7 +124,7 @@ python scripts/demo_cli.py
 - `--context-file`
 - `--verbose`
 
-Основные команды:
+Команды:
 - `/health`, `/settings`, `/url <url>`
 - `/ctx <file.json>`, `/ctx show`, `/ctx clear`
 - `/refine`
@@ -132,7 +132,7 @@ python scripts/demo_cli.py
 - `/log`, `/log N`, `/log all`, `/log clear`
 - `/help`, `/quit`
 
-Важно: часть удобного поведения (например, подстановка предыдущего `suggested_code` в `/debug`) реализована на уровне CLI, а не HTTP-контракта.
+Часть удобства реализована именно в CLI (например, подстановка предыдущего `suggested_code` в `/debug`), а не в HTTP-контракте.
 
 ### GUI (Streamlit)
 
@@ -141,16 +141,16 @@ cd localscript-agent
 python -m streamlit run scripts/demo_streamlit.py
 ```
 
-GUI дает:
-- визуальный workflow generate/refine/debug;
+GUI поддерживает:
+- визуальный flow generate/refine/debug;
 - clarification chat в stateless-модели;
-- переключатель семантической валидации;
-- chat history save/load/clear;
-- загрузку выбранного шага в панель ответа.
+- переключение семантической валидации;
+- сохранение и загрузку истории;
+- перенос выбранного шага в панель ответа.
 
-История сохраняется в `localscript-agent/artifacts/gui_chat_history.jsonl`.
+История хранится в `localscript-agent/artifacts/gui_chat_history.jsonl`.
 
-## 8) Тесты, качество, оценка
+## Тесты и оценка
 
 ```bash
 cd localscript-agent
@@ -158,28 +158,27 @@ ruff check .
 pytest -q
 ```
 
-Публичная выборка:
+Публичная выборка (HTTP-режим):
 
 ```bash
 python scripts/eval_public.py --http --base-url http://127.0.0.1:8080
 ```
 
-или direct:
+Или direct/in-process:
 
 ```bash
 python scripts/eval_public.py
 ```
 
-## 9) Отличия от версии `lua_manual`
+## Чем отличается от `lua_manual`
 
-Ключевые различия:
-- **Clarification API**: здесь нет отдельных `/clarify` и `/generate-from-clarify`; вопросы приходят из `POST /generate` через `response_kind=clarification`.
-- **Debug**: здесь есть `POST /debug`; в `lua_manual` его нет.
-- **Модель данных API**: здесь rich telemetry (`attempts`, `stop_reason`, `degraded`, `llm_rounds`), в `lua_manual` акцент на `confidence_gate_triggered` и `repair_report`.
-- **CLI**: здесь есть полнофункциональный `scripts/demo_cli.py`; в `lua_manual` нет REPL-клиента.
-- **Интеграция контекста**: здесь семантический JSON-контекст обычно встраивается в `prompt` (`Context:`) и извлекается сервером в pipeline; в `lua_manual` есть явные поля `context` и отдельный clarify-flow.
+- нет отдельных `/clarify` и `/generate-from-clarify`, уточнения приходят через `POST /generate`;
+- есть `POST /debug`;
+- богаче telemetry (`attempts`, `stop_reason`, `degraded`, `llm_rounds`);
+- есть полноценный `scripts/demo_cli.py`;
+- контекст обычно встраивается в `prompt` как `Context:` и извлекается сервером в pipeline.
 
-## 10) Дополнительные документы
+## Дополнительные документы
 
 - `localscript-agent/README.md`
 - `localscript-agent/docs/SETUP_GUIDE.md`

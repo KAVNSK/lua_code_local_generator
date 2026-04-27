@@ -1,6 +1,6 @@
 # Synthetic / training data
 
-- **`seed_agent_examples.jsonl`**: hand-authored ground-truth rows (Cursor agent), safe for QLoRA targets.
-- **`generated.jsonl`**: produced by `scripts/generate_synthetic_dataset.py` — only deterministic variations of verified templates (no LLM labels).
+- `seed_agent_examples.jsonl`: вручную подготовленные ground-truth примеры (Cursor agent), подходят как цели для QLoRA.
+- `generated.jsonl`: генерируется скриптом `scripts/generate_synthetic_dataset.py`; внутри только детерминированные вариации проверенных шаблонов (без LLM-разметки).
 
-Do **not** use local Ollama outputs as training labels.
+Не используйте ответы локальной `Ollama` как training labels.
